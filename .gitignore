@@ -1,1 +1,27 @@
 bootloader.zip
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Qt Creator / qmake local files
+tools/OTA/.qtcreator/
+tools/OTA/.qmake.stash
+
+# OTA build outputs
+tools/OTA/build/
+tools/OTA/debug/
+tools/OTA/release/
+
+# Keil/MDK build outputs
+*.axf
+*.hex
+*.map
+*.o
+*.d
+*.crf
+*.dep
+*.htm
+*.lst
+*.lnp
+*.Bak
