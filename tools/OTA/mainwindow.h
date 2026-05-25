@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QMainWindow>
 #include <QList>
+#include <QSerialPort>
 #include <QString>
 
 #include <cstdint>
@@ -17,7 +18,7 @@ class QLineEdit;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
-class QSerialPort;
+class QSpinBox;
 class QSerialPortInfo;
 class QSplitter;
 class QVBoxLayout;
@@ -101,8 +102,9 @@ private:
     void refreshSerialPorts();
     void toggleSerialPort();
     void sendSerialText();
+    void sendBootloaderCommand();
     void handleSerialReadyRead();
-    void handleSerialError();
+    void handleSerialError(QSerialPort::SerialPortError error);
     void updateSerialUiState(bool isOpen);
     void updateUpgradeUiState(UpgradeState state);
     void loadFirmwareFile(const QString &filePath);
@@ -112,6 +114,14 @@ private:
     bool parseTargetAddress(const QString &text, quint32 *address, QString *errorMessage = nullptr) const;
     bool validateFirmwareRange(quint32 startAddress, qsizetype imageSize, QString *errorMessage = nullptr) const;
     QString formatTargetAddress(quint32 address) const;
+    int currentAckTimeoutMs() const;
+    int currentHandshakeRetries() const;
+    int currentChunkSize() const;
+    int currentChunkIntervalMs() const;
+    void updateChunkSizeDisplay();
+    void applyLinkProfilePreset(int index);
+    void syncLinkProfileToCustom();
+    QByteArray buildConfiguredPayload(const QString &text, bool hexMode, QString *errorMessage = nullptr) const;
     void updateTargetAddressDisplay();
     void updateMaxFirmwareSizeDisplay();
     quint32 currentMaxFirmwareSize() const;
@@ -152,9 +162,11 @@ private:
     QComboBox *comboParity = nullptr;
     QComboBox *comboStopBits = nullptr;
     QComboBox *comboEncoding = nullptr;
+    QComboBox *comboLinkProfile = nullptr;
     QLineEdit *editFilePath = nullptr;
     QLineEdit *editTargetAddress = nullptr;
     QLineEdit *editTx = nullptr;
+    QLineEdit *editBootloaderCommand = nullptr;
     QLabel *labelFileMeta = nullptr;
     QLabel *labelTransportState = nullptr;
     QLabel *labelPortDescription = nullptr;
@@ -166,6 +178,10 @@ private:
     QPlainTextEdit *textOtaLog = nullptr;
     QPlainTextEdit *textSerialMonitor = nullptr;
     QProgressBar *progressUpgrade = nullptr;
+    QSpinBox *spinAckTimeoutMs = nullptr;
+    QSpinBox *spinHandshakeRetries = nullptr;
+    QSpinBox *spinChunkSize = nullptr;
+    QSpinBox *spinChunkIntervalMs = nullptr;
     QFrame *tileTransport = nullptr;
     QFrame *tileFirmware = nullptr;
     QFrame *tileTarget = nullptr;
@@ -175,10 +191,12 @@ private:
     QPushButton *btnBrowseFile = nullptr;
     QPushButton *btnStartUpgrade = nullptr;
     QPushButton *btnStopUpgrade = nullptr;
+    QPushButton *btnEnterBootloader = nullptr;
     QPushButton *btnSendText = nullptr;
     QPushButton *btnClearSerial = nullptr;
     QCheckBox *chkTimestamp = nullptr;
     QCheckBox *chkHexDisplay = nullptr;
+    QCheckBox *chkBootloaderHex = nullptr;
     QSerialPort *serialPort = nullptr;
 
     QByteArray firmwareImage;
@@ -192,6 +210,7 @@ private:
     UpgradeState currentUpgradeState = UpgradeState::Idle;
     bool themeUpdateInProgress = false;
     bool cancelUpgradeRequested = false;
+    bool serialTimeoutLogSuppressed = false;
 };
 
 #endif // MAINWINDOW_H

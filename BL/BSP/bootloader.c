@@ -83,12 +83,14 @@ static uint8_t bootloader_rx_dma_buffer[BOOTLOADER_RX_BUFFER_SIZE];
  * @note 拷贝后的帧数据，避免DMA覆盖
  */
 static uint8_t bootloader_rx_frame_buffer[BOOTLOADER_RX_BUFFER_SIZE];
+static uint8_t bootloader_rx_stream_buffer[BOOTLOADER_RX_BUFFER_SIZE];
 
 /**
  * @brief 接收帧长度
  * @note 由串口中断回调更新
  */
 static volatile uint16_t bootloader_rx_frame_len = 0U;
+static volatile uint16_t bootloader_rx_stream_len = 0U;
 
 /**
  * @brief 接收帧就绪标志
@@ -185,6 +187,8 @@ static uint8_t Bootloader_IsAppValidAtAddress(uint32_t app_address);
 static HAL_StatusTypeDef Bootloader_SaveAppAddress(uint32_t app_address);
 static void Bootloader_StartReceive(void);
 static void Bootloader_ResetSession(uint8_t keep_ready_state);
+static void Bootloader_AppendRxData(const uint8_t *data, uint16_t len);
+static uint8_t Bootloader_TryExtractFrame(void);
 static void Bootloader_SendFrame(uint8_t cmd, uint8_t seq, const uint8_t *payload, uint16_t len);
 static void Bootloader_SendAck(uint8_t seq, uint8_t cmd, Bootloader_Error_t err);
 static void Bootloader_SendNack(uint8_t seq, uint8_t cmd, Bootloader_Error_t err);
@@ -363,6 +367,91 @@ static void Bootloader_ResetSession(uint8_t keep_ready_state)
     boot_state = keep_ready_state ? BOOT_STATE_READY : BOOT_STATE_IDLE;
 }
 
+static void Bootloader_AppendRxData(const uint8_t *data, uint16_t len)
+{
+    if ((data == NULL) || (len == 0U))
+    {
+        return;
+    }
+
+    if ((uint32_t)bootloader_rx_stream_len + len > BOOTLOADER_RX_BUFFER_SIZE)
+    {
+        bootloader_rx_stream_len = 0U;
+        bootloader_rx_frame_len = 0U;
+        bootloader_rx_frame_ready = 0U;
+        bootloader_rx_overflow = 1U;
+        return;
+    }
+
+    memcpy(&bootloader_rx_stream_buffer[bootloader_rx_stream_len], data, len);
+    bootloader_rx_stream_len = (uint16_t)(bootloader_rx_stream_len + len);
+}
+
+static uint8_t Bootloader_TryExtractFrame(void)
+{
+    uint16_t index = 0U;
+    uint16_t payload_len;
+    uint16_t frame_len;
+    uint16_t remaining_len;
+
+    if (bootloader_rx_frame_ready != 0U)
+    {
+        return 0U;
+    }
+
+    while ((index + 1U) < bootloader_rx_stream_len)
+    {
+        if ((bootloader_rx_stream_buffer[index] == BOOTLOADER_FRAME_HEADER_0) &&
+            (bootloader_rx_stream_buffer[index + 1U] == BOOTLOADER_FRAME_HEADER_1))
+        {
+            break;
+        }
+        index++;
+    }
+
+    if (index > 0U)
+    {
+        remaining_len = (uint16_t)(bootloader_rx_stream_len - index);
+        memmove(bootloader_rx_stream_buffer, &bootloader_rx_stream_buffer[index], remaining_len);
+        bootloader_rx_stream_len = remaining_len;
+    }
+
+    if (bootloader_rx_stream_len < 6U)
+    {
+        return 0U;
+    }
+
+    payload_len = (uint16_t)bootloader_rx_stream_buffer[4] |
+                  ((uint16_t)bootloader_rx_stream_buffer[5] << 8);
+    if (payload_len > BOOTLOADER_FRAME_MAX_DATA_LEN)
+    {
+        memmove(bootloader_rx_stream_buffer,
+                &bootloader_rx_stream_buffer[1],
+                (uint16_t)(bootloader_rx_stream_len - 1U));
+        bootloader_rx_stream_len--;
+        return 0U;
+    }
+
+    frame_len = (uint16_t)(payload_len + 8U);
+    if (bootloader_rx_stream_len < frame_len)
+    {
+        return 0U;
+    }
+
+    memcpy(bootloader_rx_frame_buffer, bootloader_rx_stream_buffer, frame_len);
+    bootloader_rx_frame_len = frame_len;
+    bootloader_rx_frame_ready = 1U;
+
+    remaining_len = (uint16_t)(bootloader_rx_stream_len - frame_len);
+    if (remaining_len > 0U)
+    {
+        memmove(bootloader_rx_stream_buffer, &bootloader_rx_stream_buffer[frame_len], remaining_len);
+    }
+    bootloader_rx_stream_len = remaining_len;
+
+    return 1U;
+}
+
 /**
  * @brief 初始化引导加载程序
  * @note 初始化状态变量、检测应用程序有效性、启动串口接收
@@ -376,6 +465,7 @@ void Bootloader_Init(void)
     jump_requested = 0U;                         /* 清空跳转请求 */
     bootloader_rx_frame_ready = 0U;              /* 清空帧就绪标志 */
     bootloader_rx_frame_len = 0U;                /* 清空帧长度 */
+    bootloader_rx_stream_len = 0U;               /* 清空流缓冲长度 */
     bootloader_rx_overflow = 0U;                 /* 清空溢出标志 */
     Bootloader_ResetSession(0U);                 /* 重置会话为IDLE态 */
     Bootloader_StartReceive();                   /* 启动串口接收 */
@@ -490,6 +580,7 @@ static void Bootloader_ProcessRxFrame(void)
     len = bootloader_rx_frame_len;
     memcpy(raw_frame, bootloader_rx_frame_buffer, len);
     bootloader_rx_frame_ready = 0U; /* 清空就绪标志 */
+    (void)Bootloader_TryExtractFrame();
     __enable_irq();
 
     /* 解析帧结构 */
@@ -1136,16 +1227,14 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
     if (huart->Instance == USART1)
     {
-        /* 数据未溢出则拷贝到帧缓冲区 */
-        if ((bootloader_rx_frame_ready == 0U) && (size <= BOOTLOADER_RX_BUFFER_SIZE))
+        /* 将分段到达的数据追加到流缓冲区，再按协议帧切分 */
+        if (size <= BOOTLOADER_RX_BUFFER_SIZE)
         {
-            memcpy(bootloader_rx_frame_buffer, bootloader_rx_dma_buffer, size);
-            bootloader_rx_frame_len = size;
-            bootloader_rx_frame_ready = 1U;
+            Bootloader_AppendRxData(bootloader_rx_dma_buffer, size);
+            (void)Bootloader_TryExtractFrame();
         }
         else
         {
-            /* 标记溢出 */
             bootloader_rx_overflow = 1U;
         }
 

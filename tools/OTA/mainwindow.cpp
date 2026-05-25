@@ -30,6 +30,7 @@
 #include <QSerialPortInfo>
 #include <QSignalBlocker>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QStyle>
 #include <QStyleHints>
 #include <QTextBlock>
@@ -53,6 +54,7 @@ namespace
     constexpr quint32 kFlashPageSize = 0x00000400u;
     constexpr int kDefaultChunkSize = 128;
     constexpr int kDefaultTimeoutMs = 1000;
+    constexpr int kDefaultChunkIntervalMs = 0;
     constexpr int kReadPollIntervalMs = 50;
     constexpr int kHandshakeRetries = 5;
 
@@ -148,14 +150,39 @@ void MainWindow::buildUi()
     comboParity = new QComboBox(this);
     comboStopBits = new QComboBox(this);
     comboEncoding = new QComboBox(this);
+    comboLinkProfile = new QComboBox(this);
     for (QComboBox *box : {
-             comboPort, comboBaud, comboDataBits, comboParity, comboStopBits, comboEncoding
+             comboPort, comboBaud, comboDataBits, comboParity, comboStopBits, comboEncoding, comboLinkProfile
          }) {
         box->setMinimumHeight(36);
         box->setView(new QListView(box));
     }
     comboBaud->setEditable(false);
     comboBaud->installEventFilter(this);
+    spinAckTimeoutMs = new QSpinBox(this);
+    spinAckTimeoutMs->setMinimum(200);
+    spinAckTimeoutMs->setMaximum(60000);
+    spinAckTimeoutMs->setSingleStep(100);
+    spinAckTimeoutMs->setMinimumHeight(36);
+    spinAckTimeoutMs->setSuffix(" ms");
+    spinHandshakeRetries = new QSpinBox(this);
+    spinHandshakeRetries->setMinimum(1);
+    spinHandshakeRetries->setMaximum(30);
+    spinHandshakeRetries->setSingleStep(1);
+    spinHandshakeRetries->setMinimumHeight(36);
+    spinHandshakeRetries->setSuffix(" 次");
+    spinChunkSize = new QSpinBox(this);
+    spinChunkSize->setMinimum(16);
+    spinChunkSize->setMaximum(512);
+    spinChunkSize->setSingleStep(16);
+    spinChunkSize->setMinimumHeight(36);
+    spinChunkSize->setSuffix(" B");
+    spinChunkIntervalMs = new QSpinBox(this);
+    spinChunkIntervalMs->setMinimum(0);
+    spinChunkIntervalMs->setMaximum(5000);
+    spinChunkIntervalMs->setSingleStep(10);
+    spinChunkIntervalMs->setMinimumHeight(36);
+    spinChunkIntervalMs->setSuffix(" ms");
     editFilePath = new QLineEdit(this);
     editFilePath->setReadOnly(true);
     editFilePath->setPlaceholderText("选择 .bin 或 .hex 固件文件");
@@ -163,17 +190,21 @@ void MainWindow::buildUi()
     editTargetAddress->setPlaceholderText("目标地址，例如 0x08004000，范围 0x08004000 ~ 0x0800F800，需 0x400 对齐");
     editTx = new QLineEdit(this);
     editTx->setPlaceholderText("输入要发送的文本或十六进制数据");
+    editBootloaderCommand = new QLineEdit(this);
+    editBootloaderCommand->setPlaceholderText("进入 Bootloader 指令，可填写文本或 HEX");
     btnRefreshPorts = new QPushButton("扫描", this);
     btnOpenPort = new QPushButton("打开", this);
     btnBrowseFile = new QPushButton("选择文件", this);
     btnStartUpgrade = new QPushButton("升级", this);
     btnStopUpgrade = new QPushButton("停止", this);
+    btnEnterBootloader = new QPushButton("进入 Bootloader", this);
     btnSendText = new QPushButton("发送", this);
     btnClearSerial = new QPushButton("清空", this);
     btnOpenPort->setObjectName("primaryButton");
     btnBrowseFile->setObjectName("accentButton");
     btnStartUpgrade->setObjectName("primaryButton");
     btnStopUpgrade->setObjectName("dangerButton");
+    btnEnterBootloader->setObjectName("accentButton");
     btnSendText->setObjectName("accentButton");
     auto addLabel = [this](const QString & text) {
         auto *label = new QLabel(text, this);
@@ -218,6 +249,20 @@ void MainWindow::buildUi()
     paramGrid->addWidget(comboParity, 1, 1);
     paramGrid->addWidget(comboStopBits, 1, 2);
     serialBody->addLayout(paramGrid);
+    auto *linkGrid = new QGridLayout;
+    linkGrid->setHorizontalSpacing(10);
+    linkGrid->setVerticalSpacing(8);
+    linkGrid->addWidget(addLabel("链路场景"), 0, 0);
+    linkGrid->addWidget(addLabel("ACK 超时"), 0, 1);
+    linkGrid->addWidget(addLabel("握手重试"), 2, 0);
+    linkGrid->addWidget(addLabel("分包大小"), 2, 1);
+    linkGrid->addWidget(addLabel("分包间隔"), 4, 0);
+    linkGrid->addWidget(comboLinkProfile, 1, 0);
+    linkGrid->addWidget(spinAckTimeoutMs, 1, 1);
+    linkGrid->addWidget(spinHandshakeRetries, 3, 0);
+    linkGrid->addWidget(spinChunkSize, 3, 1);
+    linkGrid->addWidget(spinChunkIntervalMs, 5, 0);
+    serialBody->addLayout(linkGrid);
     labelTransportState = new QLabel("当前状态：未应用", serialCard);
     labelTransportState->setObjectName("statusChipIdle");
     labelTransportState->setAlignment(Qt::AlignCenter);
@@ -275,6 +320,14 @@ void MainWindow::buildUi()
     upgradeButtons->addWidget(btnStartUpgrade, 1);
     upgradeButtons->addWidget(btnStopUpgrade, 1);
     actionBody->addLayout(upgradeButtons);
+    auto *bootRow = new QHBoxLayout;
+    bootRow->setSpacing(10);
+    chkBootloaderHex = new QCheckBox("HEX 指令", this);
+    btnEnterBootloader->setFixedWidth(132);
+    bootRow->addWidget(editBootloaderCommand, 1);
+    bootRow->addWidget(chkBootloaderHex);
+    bootRow->addWidget(btnEnterBootloader);
+    actionBody->addLayout(bootRow);
     leftColumn->addStretch();
     auto *metricRow = new QHBoxLayout;
     metricRow->setSpacing(14);
@@ -497,11 +550,23 @@ void MainWindow::populatePlaceholders()
     comboEncoding->addItem("UTF-8", "UTF-8");
     comboEncoding->addItem("GBK", "GBK");
     comboEncoding->setCurrentIndex(0);
+    comboLinkProfile->addItem("本地串口", QVariantList{1000, 5, 128, 0});
+    comboLinkProfile->addItem("LoRa 远程", QVariantList{8000, 10, 32, 120});
+    comboLinkProfile->addItem("蓝牙透传", QVariantList{2500, 6, 64, 30});
+    comboLinkProfile->addItem("WiFi/4G", QVariantList{4000, 6, 128, 20});
+    comboLinkProfile->addItem("自定义", QVariantList{-1, -1, -1, -1});
+    comboLinkProfile->setCurrentIndex(0);
+    spinAckTimeoutMs->setValue(kDefaultTimeoutMs);
+    spinHandshakeRetries->setValue(kHandshakeRetries);
+    spinChunkSize->setValue(kDefaultChunkSize);
+    spinChunkIntervalMs->setValue(kDefaultChunkIntervalMs);
+    editBootloaderCommand->setText("BOOT");
+    chkBootloaderHex->setChecked(false);
     editTargetAddress->setText(formatTargetAddress(targetAddress));
     labelFileMeta->setText("当前未加载固件文件。");
     labelFirmwareType->setText("--");
     labelImageSize->setText("--");
-    labelChunkSize->setText(QString("%1 字节").arg(kDefaultChunkSize));
+    updateChunkSizeDisplay();
     labelProtocolState->setText("就绪");
     updateTargetAddressDisplay();
     updateMaxFirmwareSizeDisplay();
@@ -524,6 +589,7 @@ void MainWindow::wireInteractions()
     connect(btnRefreshPorts, &QPushButton::clicked, this, &MainWindow::refreshSerialPorts);
     connect(btnOpenPort, &QPushButton::clicked, this, &MainWindow::toggleSerialPort);
     connect(btnSendText, &QPushButton::clicked, this, &MainWindow::sendSerialText);
+    connect(btnEnterBootloader, &QPushButton::clicked, this, &MainWindow::sendBootloaderCommand);
     connect(btnBrowseFile, &QPushButton::clicked, this, [this]() {
         const QString filePath = QFileDialog::getOpenFileName(
                                      this,
@@ -538,6 +604,7 @@ void MainWindow::wireInteractions()
     connect(btnStartUpgrade, &QPushButton::clicked, this, &MainWindow::startUpgrade);
     connect(btnStopUpgrade, &QPushButton::clicked, this, &MainWindow::stopUpgrade);
     connect(editTx, &QLineEdit::returnPressed, btnSendText, &QPushButton::click);
+    connect(editBootloaderCommand, &QLineEdit::returnPressed, btnEnterBootloader, &QPushButton::click);
     connect(editTargetAddress, &QLineEdit::editingFinished, this, [this]() {
         applyTargetAddressFromInput(true);
     });
@@ -549,6 +616,26 @@ void MainWindow::wireInteractions()
     });
     connect(comboEncoding, &QComboBox::currentIndexChanged, this, [this](int) {
         rerenderSerialMonitorHistory();
+    });
+    connect(comboLinkProfile, &QComboBox::currentIndexChanged, this, [this](int index) {
+        applyLinkProfilePreset(index);
+    });
+    connect(spinAckTimeoutMs, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        syncLinkProfileToCustom();
+        appendLog(textOtaLog, QString("ACK 超时已设置为 %1 ms。").arg(value));
+    });
+    connect(spinHandshakeRetries, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        syncLinkProfileToCustom();
+        appendLog(textOtaLog, QString("握手重试已设置为 %1 次。").arg(value));
+    });
+    connect(spinChunkSize, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        syncLinkProfileToCustom();
+        updateChunkSizeDisplay();
+        appendLog(textOtaLog, QString("分包大小已设置为 %1 字节。").arg(value));
+    });
+    connect(spinChunkIntervalMs, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        syncLinkProfileToCustom();
+        appendLog(textOtaLog, QString("分包间隔已设置为 %1 ms。").arg(value));
     });
     connect(comboPort, &QComboBox::currentIndexChanged, this, [this](int index) {
         if (index < 0) {
@@ -568,11 +655,7 @@ void MainWindow::wireInteractions()
         appendSerialMonitorEntry(SerialMonitorEntryKind::System, QByteArray(), "[系统] 调试窗口已清空。");
     });
     connect(serialPort, &QSerialPort::readyRead, this, &MainWindow::handleSerialReadyRead);
-    connect(serialPort, &QSerialPort::errorOccurred, this, [this](QSerialPort::SerialPortError error) {
-        if (error != QSerialPort::NoError) {
-            handleSerialError();
-        }
-    });
+    connect(serialPort, &QSerialPort::errorOccurred, this, &MainWindow::handleSerialError);
 }
 
 void MainWindow::refreshSerialPorts()
@@ -621,6 +704,7 @@ void MainWindow::toggleSerialPort()
     if (serialPort->isOpen()) {
         const QString portName = serialPort->portName();
         serialPort->close();
+        serialTimeoutLogSuppressed = false;
         serialRxBuffer.clear();
         updateSerialUiState(false);
         appendLog(textOtaLog, QString("串口已关闭：%1").arg(portName));
@@ -650,6 +734,7 @@ void MainWindow::toggleSerialPort()
         appendLog(textOtaLog, QString("串口打开失败：%1").arg(serialPort->errorString()));
         return;
     }
+    serialTimeoutLogSuppressed = false;
     serialPort->clear(QSerialPort::AllDirections);
     serialRxBuffer.clear();
     updateSerialUiState(true);
@@ -668,17 +753,11 @@ void MainWindow::sendSerialText()
         appendLog(textOtaLog, "串口未打开，无法发送数据。");
         return;
     }
-    QByteArray payload;
-    if (chkHexDisplay->isChecked()) {
-        QString normalized = text;
-        normalized.remove(QRegularExpression("\\s+"));
-        if (normalized.size() % 2 != 0) {
-            appendLog(textOtaLog, "HEX 发送内容长度必须为偶数。");
-            return;
-        }
-        payload = QByteArray::fromHex(normalized.toLatin1());
-    } else {
-        payload = encodeSerialText(text);
+    QString errorMessage;
+    const QByteArray payload = buildConfiguredPayload(text, chkHexDisplay->isChecked(), &errorMessage);
+    if (!errorMessage.isEmpty()) {
+        appendLog(textOtaLog, errorMessage);
+        return;
     }
     if (serialPort->write(payload) < 0) {
         appendLog(textOtaLog, QString("发送失败：%1").arg(serialPort->errorString()));
@@ -687,6 +766,32 @@ void MainWindow::sendSerialText()
     serialPort->flush();
     appendSerialMonitorEntry(SerialMonitorEntryKind::Tx, payload);
     editTx->clear();
+}
+
+void MainWindow::sendBootloaderCommand()
+{
+    const QString text = editBootloaderCommand ? editBootloaderCommand->text() : QString();
+    if (text.trimmed().isEmpty()) {
+        appendLog(textOtaLog, "进入 Bootloader 指令为空，请先配置发送内容。");
+        return;
+    }
+    if (!serialPort->isOpen()) {
+        appendLog(textOtaLog, "串口未打开，无法发送 Bootloader 指令。");
+        return;
+    }
+    QString errorMessage;
+    const QByteArray payload = buildConfiguredPayload(text, chkBootloaderHex && chkBootloaderHex->isChecked(), &errorMessage);
+    if (!errorMessage.isEmpty()) {
+        appendLog(textOtaLog, errorMessage);
+        return;
+    }
+    if (serialPort->write(payload) < 0) {
+        appendLog(textOtaLog, QString("Bootloader 指令发送失败：%1").arg(serialPort->errorString()));
+        return;
+    }
+    serialPort->flush();
+    appendSerialMonitorEntry(SerialMonitorEntryKind::Tx, payload, "[发送] Bootloader 入口指令");
+    appendLog(textOtaLog, QString("已发送进入 Bootloader 指令，长度 %1 字节。").arg(payload.size()));
 }
 
 void MainWindow::handleSerialReadyRead()
@@ -698,8 +803,19 @@ void MainWindow::handleSerialReadyRead()
     }
 }
 
-void MainWindow::handleSerialError()
+void MainWindow::handleSerialError(QSerialPort::SerialPortError error)
 {
+    if (error == QSerialPort::NoError) {
+        return;
+    }
+    if (error == QSerialPort::TimeoutError) {
+        if (!serialTimeoutLogSuppressed) {
+            appendLog(textOtaLog, "串口等待超时，已按链路场景持续重试，后续相同超时不再重复记录。");
+            serialTimeoutLogSuppressed = true;
+        }
+        return;
+    }
+    serialTimeoutLogSuppressed = false;
     appendLog(textOtaLog, QString("串口错误：%1").arg(serialPort->errorString()));
     if (!serialPort->isOpen()) {
         updateSerialUiState(false);
@@ -715,10 +831,20 @@ void MainWindow::updateSerialUiState(bool isOpen)
     comboDataBits->setEnabled(!isOpen && !otaBusy);
     comboParity->setEnabled(!isOpen && !otaBusy);
     comboStopBits->setEnabled(!isOpen && !otaBusy);
+    comboLinkProfile->setEnabled(!otaBusy);
+    spinAckTimeoutMs->setEnabled(!otaBusy);
+    spinHandshakeRetries->setEnabled(!otaBusy);
+    spinChunkSize->setEnabled(!otaBusy);
+    spinChunkIntervalMs->setEnabled(!otaBusy);
     btnRefreshPorts->setEnabled(!isOpen && !otaBusy);
     btnOpenPort->setEnabled((isOpen || hasValidPort) && !otaBusy);
     btnOpenPort->setText(isOpen ? "关闭串口" : "应用并打开");
     btnSendText->setEnabled(isOpen && !otaBusy);
+    btnEnterBootloader->setEnabled(isOpen && !otaBusy);
+    editBootloaderCommand->setEnabled(!otaBusy);
+    if (chkBootloaderHex) {
+        chkBootloaderHex->setEnabled(!otaBusy);
+    }
     if (isOpen) {
         labelTransportState->setText(QString("当前已应用  |  %1 @ %2").arg(serialPort->portName()).arg(comboBaud->currentText()));
         labelTransportState->setObjectName("badgeAccent");
@@ -738,8 +864,13 @@ void MainWindow::updateUpgradeUiState(UpgradeState state)
     btnStartUpgrade->setEnabled(!running && !cancelling);
     btnBrowseFile->setEnabled(!running && !cancelling);
     editTargetAddress->setEnabled(!running && !cancelling);
+    editBootloaderCommand->setEnabled(!running && !cancelling);
     btnStopUpgrade->setEnabled(running || cancelling);
     btnStopUpgrade->setText(cancelling ? "停止中..." : "停止");
+    btnEnterBootloader->setEnabled(serialPort->isOpen() && !running && !cancelling);
+    if (chkBootloaderHex) {
+        chkBootloaderHex->setEnabled(!running && !cancelling);
+    }
     labelProtocolState->setText(
         state == UpgradeState::Idle ? "就绪" :
         state == UpgradeState::Running ? "升级中" :
@@ -778,7 +909,7 @@ void MainWindow::loadFirmwareFile(const QString &filePath)
         refreshFirmwareMeta();
         labelFirmwareType->setText(info.suffix().isEmpty() ? "未知" : "." + info.suffix().toLower());
         labelImageSize->setText(QString::number(image.size() / 1024.0, 'f', 1) + " KB");
-        labelChunkSize->setText(QString("%1 字节").arg(kDefaultChunkSize));
+        updateChunkSizeDisplay();
         labelProtocolState->setText("文件已加载");
         appendLog(textOtaLog,
                   QString("固件文件已载入：%1，大小 %2 字节，目标地址 %3。")
@@ -1004,6 +1135,118 @@ QString MainWindow::formatTargetAddress(quint32 address) const
     return QString("0x%1").arg(address, 8, 16, QLatin1Char('0')).toUpper();
 }
 
+int MainWindow::currentAckTimeoutMs() const
+{
+    if (!spinAckTimeoutMs) {
+        return kDefaultTimeoutMs;
+    }
+    return spinAckTimeoutMs->value();
+}
+
+int MainWindow::currentHandshakeRetries() const
+{
+    if (!spinHandshakeRetries) {
+        return kHandshakeRetries;
+    }
+    return spinHandshakeRetries->value();
+}
+
+int MainWindow::currentChunkSize() const
+{
+    if (!spinChunkSize) {
+        return kDefaultChunkSize;
+    }
+    return spinChunkSize->value();
+}
+
+int MainWindow::currentChunkIntervalMs() const
+{
+    if (!spinChunkIntervalMs) {
+        return kDefaultChunkIntervalMs;
+    }
+    return spinChunkIntervalMs->value();
+}
+
+void MainWindow::updateChunkSizeDisplay()
+{
+    if (labelChunkSize) {
+        labelChunkSize->setText(QString("%1 字节").arg(currentChunkSize()));
+    }
+}
+
+void MainWindow::applyLinkProfilePreset(int index)
+{
+    const QVariantList values = comboLinkProfile->itemData(index).toList();
+    if (values.size() >= 4 && values.at(0).toInt() > 0) {
+        const QSignalBlocker ackBlocker(spinAckTimeoutMs);
+        const QSignalBlocker retryBlocker(spinHandshakeRetries);
+        const QSignalBlocker chunkBlocker(spinChunkSize);
+        const QSignalBlocker intervalBlocker(spinChunkIntervalMs);
+        spinAckTimeoutMs->setValue(values.at(0).toInt());
+        spinHandshakeRetries->setValue(values.at(1).toInt());
+        spinChunkSize->setValue(values.at(2).toInt());
+        spinChunkIntervalMs->setValue(values.at(3).toInt());
+        updateChunkSizeDisplay();
+        appendLog(textOtaLog,
+                  QString("已切换链路场景：%1，ACK=%2 ms，握手重试=%3 次，分包=%4 B，间隔=%5 ms。")
+                  .arg(comboLinkProfile->currentText())
+                  .arg(currentAckTimeoutMs())
+                  .arg(currentHandshakeRetries())
+                  .arg(currentChunkSize())
+                  .arg(currentChunkIntervalMs()));
+        return;
+    }
+    appendLog(textOtaLog, QString("已切换链路场景：%1，请按需自定义链路参数。").arg(comboLinkProfile->currentText()));
+}
+
+void MainWindow::syncLinkProfileToCustom()
+{
+    if (!comboLinkProfile) {
+        return;
+    }
+    const auto matchesCurrentValues = [this](const QVariantList &profile) {
+        return profile.size() >= 4 &&
+               profile.at(0).toInt() == currentAckTimeoutMs() &&
+               profile.at(1).toInt() == currentHandshakeRetries() &&
+               profile.at(2).toInt() == currentChunkSize() &&
+               profile.at(3).toInt() == currentChunkIntervalMs();
+    };
+    for (int i = 0; i < comboLinkProfile->count(); ++i) {
+        const QVariantList profile = comboLinkProfile->itemData(i).toList();
+        if (profile.value(0).toInt() > 0 && matchesCurrentValues(profile)) {
+            if (comboLinkProfile->currentIndex() != i) {
+                const QSignalBlocker blocker(comboLinkProfile);
+                comboLinkProfile->setCurrentIndex(i);
+            }
+            return;
+        }
+    }
+    const int customIndex = comboLinkProfile->findText("自定义");
+    if (customIndex >= 0 && comboLinkProfile->currentIndex() != customIndex) {
+        const QSignalBlocker blocker(comboLinkProfile);
+        comboLinkProfile->setCurrentIndex(customIndex);
+    }
+}
+
+QByteArray MainWindow::buildConfiguredPayload(const QString &text, bool hexMode, QString *errorMessage) const
+{
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    if (hexMode) {
+        QString normalized = text;
+        normalized.remove(QRegularExpression("\\s+"));
+        if (normalized.size() % 2 != 0) {
+            if (errorMessage) {
+                *errorMessage = "HEX 发送内容长度必须为偶数。";
+            }
+            return {};
+        }
+        return QByteArray::fromHex(normalized.toLatin1());
+    }
+    return encodeSerialText(text);
+}
+
 void MainWindow::updateTargetAddressDisplay()
 {
     if (!tileTarget) {
@@ -1104,7 +1347,9 @@ void MainWindow::stopUpgrade()
 
 bool MainWindow::performUpgrade()
 {
-    if (!tryHandshake(kHandshakeRetries)) {
+    const int chunkSize = currentChunkSize();
+    const int chunkIntervalMs = currentChunkIntervalMs();
+    if (!tryHandshake(currentHandshakeRetries())) {
         return false;
     }
     quint8 seq = 1;
@@ -1130,13 +1375,13 @@ bool MainWindow::performUpgrade()
     seq = nextSequence(seq);
     progressUpgrade->setValue(5);
     progressUpgrade->setFormat("固件传输中  %p%");
-    const int totalChunks = (firmwareImage.size() + kDefaultChunkSize - 1) / kDefaultChunkSize;
+    const int totalChunks = (firmwareImage.size() + chunkSize - 1) / chunkSize;
     for (int index = 0; index < totalChunks; ++index) {
         if (cancelUpgradeRequested) {
             return false;
         }
-        const int offset = index * kDefaultChunkSize;
-        const QByteArray chunk = firmwareImage.mid(offset, kDefaultChunkSize);
+        const int offset = index * chunkSize;
+        const QByteArray chunk = firmwareImage.mid(offset, chunkSize);
         if (!sendCommand(ProtocolCommand::Data, seq, chunk, &ackInfo)) {
             return false;
         }
@@ -1150,6 +1395,9 @@ bool MainWindow::performUpgrade()
                   .arg(totalChunks)
                   .arg(usedSeq)
                   .arg(chunk.size()));
+        if (chunkIntervalMs > 0 && index + 1 < totalChunks) {
+            QThread::msleep(static_cast<unsigned long>(chunkIntervalMs));
+        }
         QCoreApplication::processEvents();
     }
     const quint16 crc = crc16Ibm(firmwareImage);
@@ -1179,7 +1427,8 @@ bool MainWindow::performUpgrade()
 
 bool MainWindow::tryHandshake(int retries)
 {
-    for (int attempt = 1; attempt <= retries; ++attempt) {
+    const int cappedRetries = std::max(retries, 1);
+    for (int attempt = 1; attempt <= cappedRetries; ++attempt) {
         if (cancelUpgradeRequested) {
             return false;
         }
@@ -1190,13 +1439,15 @@ bool MainWindow::tryHandshake(int retries)
                       .arg(describeBootState(ackInfo.deviceState)));
             return true;
         }
-        if (attempt < retries) {
-            appendLog(textOtaLog, QString("第 %1 次握手超时，重试中...").arg(attempt));
+        if (attempt < cappedRetries) {
+            appendLog(textOtaLog, QString("第 %1/%2 次握手未成功，准备重试...")
+                      .arg(attempt)
+                      .arg(cappedRetries));
             QThread::msleep(200);
             QCoreApplication::processEvents();
         }
     }
-    appendLog(textOtaLog, "握手失败，设备无响应。");
+    appendLog(textOtaLog, QString("握手失败，已达到 %1 次尝试上限。").arg(cappedRetries));
     return false;
 }
 
@@ -1240,7 +1491,7 @@ QByteArray MainWindow::buildFrame(ProtocolCommand command, quint8 sequence, cons
 
 bool MainWindow::waitForAck(ProtocolCommand command, quint8 sequence, AckInfo *ackInfo)
 {
-    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + kDefaultTimeoutMs;
+    const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + currentAckTimeoutMs();
     while (QDateTime::currentMSecsSinceEpoch() < deadline) {
         if (cancelUpgradeRequested) {
             return false;
